@@ -1,0 +1,190 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      binutils \
+      ca-certificates \
+      curl; \
+    rm -rf /var/lib/apt/lists/*
+
+# Go comes from go.dev instead of the distro, so that both distros build with
+# the same release and get Go's security fixes when Go publishes them. Update
+# the version and both checksums together, from https://go.dev/dl/.
+# GOTOOLCHAIN=local keeps go from downloading another toolchain: a doctl
+# release that needs a newer Go fails to build until the pin is raised.
+ARG GO_TOOLCHAIN=go1.27.3
+ARG GO_TOOLCHAIN_AMD64_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+ARG GO_TOOLCHAIN_ARM64_SHA256=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) sha256="${GO_TOOLCHAIN_AMD64_SHA256}" ;; \
+      arm64) sha256="${GO_TOOLCHAIN_ARM64_SHA256}" ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/go.tar.gz \
+      "https://dl.google.com/go/${GO_TOOLCHAIN}.linux-${TARGETARCH}.tar.gz"; \
+    echo "${sha256}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/go.tar.gz -C /usr/local; \
+    rm /tmp/go.tar.gz; \
+    test "$(/usr/local/go/bin/go env GOVERSION)" = "${GO_TOOLCHAIN}"
+# Modules come only from the Go module proxy and are checked against doctl's
+# go.sum. The source tarball also carries them in vendor/, which go would use
+# by default; GOFLAGS=-mod=readonly sets it aside for every go command.
+# Without cgo the binary is static.
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org \
+    GOFLAGS=-mod=readonly \
+    CGO_ENABLED=0
+
+# The source tarball is a git archive of the release tag with the files at its
+# root, and its header records the commit, which doctl version prints.
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/digitalocean/doctl/releases/download/v${VERSION}/doctl-${VERSION}-source.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/doctl.tar.gz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/doctl.tar.gz" | sha256sum -c -; \
+    gzip -dc /tmp/doctl.tar.gz > /tmp/doctl.tar; \
+    head -c 1024 /tmp/doctl.tar | tail -c 512 | tr -d '\000' \
+      | sed -n 's/^[0-9]* comment=\([0-9a-f]\{40\}\)$/\1/p' > /tmp/source-commit; \
+    grep -Eqx '[0-9a-f]{40}' /tmp/source-commit \
+      || { echo "the tarball header names no commit" >&2; exit 1; }; \
+    echo "doctl commit from the tarball header: $(cat /tmp/source-commit)"; \
+    mkdir -p /src/doctl; \
+    tar -xf /tmp/doctl.tar -C /src/doctl; \
+    rm /tmp/doctl.tar /tmp/doctl.tar.gz; \
+    echo "$url" > /tmp/source-url; \
+    grep -qx 'module github.com/digitalocean/doctl' /src/doctl/go.mod \
+      || { echo "go.mod does not declare github.com/digitalocean/doctl" >&2; exit 1; }
+
+WORKDIR /src/doctl
+ARG JOBS
+# The -X flags are those of upstream's .goreleaser.yml: Build is the short
+# commit, and Label=release marks a release build, which doctl version prints
+# and its update check compares against. The update check asks api.github.com
+# for the newest release; a proxy that refuses connections makes it fail at
+# once, so the version output is the same on every build.
+RUN commit="$(cat /tmp/source-commit)"; \
+    short="$(printf '%s' "$commit" | cut -c 1-8)"; \
+    major="${VERSION%%.*}"; \
+    rest="${VERSION#*.}"; \
+    minor="${rest%%.*}"; \
+    patch="${rest#*.}"; \
+    pkg=github.com/digitalocean/doctl; \
+    mkdir -p /out/usr/local/bin; \
+    go build -mod=readonly -trimpath -buildvcs=false -p "${JOBS:-$(nproc)}" \
+      -ldflags "-s -w -X ${pkg}.Build=${short} -X ${pkg}.Major=${major} -X ${pkg}.Minor=${minor} -X ${pkg}.Patch=${patch} -X ${pkg}.Label=release" \
+      -o /out/usr/local/bin/doctl ./cmd/doctl; \
+    go mod verify; \
+    bin=/out/usr/local/bin/doctl; \
+    HTTPS_PROXY=http://127.0.0.1:9 "$bin" version > /tmp/doctl-version; \
+    printf '%s\n' "doctl version ${VERSION}-release" "Git commit hash: ${short}" \
+      'API endpoint: https://api.digitalocean.com/' > /tmp/doctl-version.want; \
+    cmp /tmp/doctl-version.want /tmp/doctl-version || { cat /tmp/doctl-version >&2; exit 1; }; \
+    go version -m "$bin" > /tmp/doctl-modules; \
+    awk -F '\t' '$2 == "build" { print $3 }' /tmp/doctl-modules > /tmp/doctl-build; \
+    for setting in CGO_ENABLED=0 -trimpath=true; do \
+      grep -Fqx -- "$setting" /tmp/doctl-build \
+        || { cat /tmp/doctl-modules >&2; echo "missing build setting: $setting" >&2; exit 1; }; \
+    done; \
+    readelf -lW "$bin" > /tmp/doctl-elf; \
+    if grep -Eq '^ +(INTERP|DYNAMIC) ' /tmp/doctl-elf; then \
+      cat /tmp/doctl-elf >&2; echo "doctl is not statically linked" >&2; exit 1; \
+    fi
+
+ARG BASE_IMAGE
+# go-licenses.sh copies the license files at the root of each Go module linked
+# into doctl, and those of the Go distribution. The loops before it add the
+# files kept below a module's root, in the directory of a linked package or in
+# a directory between it and the root, such as go-jose's json package and
+# k8s.io/apimachinery's third_party/forked/golang. Go files whose names start
+# like a license file are left out. chroma's SVG formatter embeds the
+# Liberation Mono font, which is under the SIL Open Font License 1.1. chroma
+# releases before v2.24.0 have that license only in the comment at the top of
+# formatters/svg/font_liberation_mono.go, so when none of chroma's license
+# files has it, the comment goes to formatters/svg/OFL-1.1.txt in chroma's
+# directory, and the build fails if the comment lacks it. mpl-sources.sh
+# copies the source zips of the MPL-2.0 modules. The binary loads no
+# libraries, so runtime-deps only has the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=scripts/go-licenses.sh,target=/tmp/go-licenses.sh \
+    --mount=type=bind,source=scripts/mpl-sources.sh,target=/tmp/mpl-sources.sh \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/doctl; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/LICENSE.txt"; \
+    go list -deps -f '{{if .Module}}{{with .Module.Replace}}{{.Path}} {{.Dir}}{{else}}{{.Module.Path}} {{.Module.Dir}}{{end}} {{.Dir}}{{end}}' \
+      ./cmd/doctl | LC_ALL=C sort -u > /tmp/packages; \
+    test -s /tmp/packages; \
+    while read -r mod moddir dir; do \
+      case "$dir" in "$moddir"/*) ;; *) continue ;; esac; \
+      sub="${dir#"$moddir"}"; \
+      while [ -n "$sub" ]; do echo "$mod $moddir $sub"; sub="${sub%/*}"; done; \
+    done < /tmp/packages | LC_ALL=C sort -u > /tmp/license-dirs; \
+    while read -r mod moddir sub; do \
+      for f in "$moddir$sub"/*; do \
+        case "${f##*/}" in \
+          *.go) ;; \
+          [Ll][Ii][Cc][Ee][Nn][CcSs][Ee]* | [Cc][Oo][Pp][Yy][Ii][Nn][Gg]* | \
+          [Nn][Oo][Tt][Ii][Cc][Ee]* | [Pp][Aa][Tt][Ee][Nn][Tt][Ss]*) \
+            if [ -f "$f" ]; then mkdir -p "$meta/licenses/${mod}${sub}"; cp "$f" "$meta/licenses/${mod}${sub}/"; fi ;; \
+        esac; \
+      done; \
+    done < /tmp/license-dirs; \
+    sh /tmp/go-licenses.sh /out/usr/local/bin/doctl "$meta/licenses"; \
+    find "$meta/licenses" -type f -name '*.go' -delete; \
+    awk '$1 ~ /^github\.com\/alecthomas\/chroma(\/v[0-9]+)?$/ && $3 ~ /\/formatters\/svg$/ { print $1, $3 }' \
+      /tmp/packages > /tmp/chroma-svg; \
+    while read -r mod dir; do \
+      if grep -rFqs 'SIL OPEN FONT LICENSE' "$meta/licenses/$mod"; then continue; fi; \
+      ofl="$meta/licenses/$mod/formatters/svg/OFL-1.1.txt"; \
+      mkdir -p "${ofl%/*}"; \
+      sed -n '/^package /q; s|^// \{0,1\}||p' "$dir/font_liberation_mono.go" > "$ofl"; \
+      grep -Fq 'SIL OPEN FONT LICENSE Version 1.1' "$ofl" \
+        || { echo "$dir/font_liberation_mono.go has no SIL Open Font License text" >&2; exit 1; }; \
+    done < /tmp/chroma-svg; \
+    if find "$meta/licenses" -type f -size 0 | grep .; then echo "empty license file" >&2; exit 1; fi; \
+    sh /tmp/mpl-sources.sh /out/usr/local/bin/doctl "$meta/mpl-sources" > /tmp/mpl-sources; \
+    test -s /tmp/mpl-sources; \
+    echo "MPL-2.0 module sources: $(wc -l < /tmp/mpl-sources)"; \
+    echo "${VERSION}" > "$meta/version"; \
+    commit="$(cat /tmp/source-commit)"; \
+    { \
+      cat /tmp/source-url; \
+      echo "https://github.com/digitalocean/doctl/tree/${commit}"; \
+      sed 's|^|/usr/local/share/randomcontainers/doctl/mpl-sources/|' /tmp/mpl-sources; \
+    } > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "go: $(go env GOVERSION)"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "commit: ${commit}"; \
+      cat /tmp/doctl-version; \
+      sed 1d /tmp/doctl-modules; \
+    } > "$meta/buildinfo"; \
+    LC_ALL=C sort -u /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/doctl/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache HOME=/cache USER=doctl
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "doctl"]
+CMD ["--help"]
