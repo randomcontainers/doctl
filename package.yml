@@ -1,0 +1,199 @@
+name: doctl
+title: doctl
+summary: Manages Droplets, Kubernetes clusters, databases, apps and other DigitalOcean resources from the command line.
+homepage: https://docs.digitalocean.com/reference/doctl/
+# doctl (Apache-2.0) and the Go modules linked into it: Apache-2.0, MIT,
+# BSD-3-Clause (also the Go standard library, and the Go and Snappy code
+# copied into go-jose, k8s.io and klauspost/compress), BSD-2-Clause, ISC
+# (go-spew), MPL-2.0 (HashiCorp's errwrap, go-cleanhttp, go-multierror,
+# go-retryablehttp and hcl), and OFL-1.1 for the Liberation Mono font that
+# chroma embeds in its SVG formatter. go-digest's LICENSE.docs (CC-BY-SA-4.0)
+# covers its documentation, which is not compiled in. The image carries the
+# source zips of the MPL-2.0 modules.
+license: Apache-2.0 AND MIT AND BSD-3-Clause AND BSD-2-Clause AND MPL-2.0 AND ISC AND OFL-1.1
+upstream:
+  source: github-release
+  repository: digitalocean/doctl
+  # Betas such as v2.0.0-beta.2 are pre-releases and do not match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 2.0.0
+  # A git archive of the release tag, attached to each release and listed in
+  # the release's checksums file.
+  artifact:
+    url: https://github.com/digitalocean/doctl/releases/download/v{version}/doctl-{version}-source.tar.gz
+    checksums:
+      url: https://github.com/digitalocean/doctl/releases/download/v{version}/doctl-{version}-checksums.sha256
+      algorithm: sha256
+    sha256: 98d74e373acf4f04fced1125f446709cef26b98b3afad6954e8efb469fe13e05
+image:
+  entrypoint: [doctl]
+  cmd: [--help]
+  env:
+    # doctl keeps its config in $HOME/.config/doctl, and kubeconfig save
+    # writes $HOME/.kube/config.
+    HOME: /cache
+    # doctl looks up the current user when it starts, and without cgo Go
+    # needs USER for a UID that has no passwd entry, or every command fails
+    # (digitalocean/doctl#734).
+    USER: doctl
+test:
+  - |
+    test "$HOME" = /cache || { echo "expected HOME=/cache, got $HOME" >&2; exit 1; }
+    # doctl version asks api.github.com for the newest release. A proxy that
+    # refuses connections makes the lookup fail at once, so no notice follows.
+    HTTPS_PROXY=http://127.0.0.1:9
+    export HTTPS_PROXY
+    doctl version > version.txt
+    sed -n 1p version.txt > version.first
+    printf '%s\n' "doctl version $VERSION-release" > version.want
+    cmp version.want version.first || { echo "expected 'doctl version $VERSION-release', got:" >&2; cat version.txt >&2; exit 1; }
+    sed -n 2p version.txt | grep -Eqx 'Git commit hash: [0-9a-f]{8}' || { cat version.txt >&2; exit 1; }
+    sed 1,2d version.txt > version.rest
+    printf '%s\n' 'API endpoint: https://api.digitalocean.com/' > version.rest.want
+    cmp version.rest.want version.rest || { cat version.txt >&2; exit 1; }
+    DIGITALOCEAN_API_URL=http://127.0.0.1:9/ doctl version -o json > version.json
+    grep -Fq "\"version\": \"$VERSION-release\"," version.json || { cat version.json >&2; exit 1; }
+    grep -Fq '"apiEndpoint": "http://127.0.0.1:9/",' version.json || { cat version.json >&2; exit 1; }
+  - |
+    doctl --help > help.txt
+    grep -Eq '^ +compute +Display commands that manage infrastructure' help.txt || { cat help.txt >&2; exit 1; }
+    # An unknown subcommand at any level exits with 255.
+    if doctl compute nosuchcmd > unknown.txt 2>&1; then status=0; else status=$?; fi
+    test "$status" -eq 255 || { cat unknown.txt >&2; echo "expected exit status 255, got $status" >&2; exit 1; }
+    grep -Fq 'unknown command "nosuchcmd" for "doctl compute"' unknown.txt || { cat unknown.txt >&2; exit 1; }
+    doctl completion bash > completion.bash
+    grep -Fq '__start_doctl()' completion.bash || { head -n 20 completion.bash >&2; exit 1; }
+  - |
+    # Without a token doctl stops before any request, and a refused
+    # connection fails at once when retries are off.
+    if doctl account get > no-token.txt 2>&1; then
+      cat no-token.txt >&2; echo "account get succeeded without a token" >&2; exit 1
+    fi
+    grep -Fq 'access token is required' no-token.txt || { cat no-token.txt >&2; exit 1; }
+    if doctl account get -t test-token -u http://127.0.0.1:9/ --http-retry-max 0 > refused.txt 2>&1; then
+      cat refused.txt >&2; echo "account get succeeded without a server" >&2; exit 1
+    fi
+    grep -Fq 'connection refused' refused.txt || { cat refused.txt >&2; exit 1; }
+  - |
+    # A stand-in for the API on 127.0.0.1:8089 answers every request with the
+    # same JSON document, which has a field for each command below, and logs
+    # the request headers. perl (Ubuntu) or busybox nc (Alpine) serves it.
+    printf '%s' '{"account": {"email": "test@example.invalid", "uuid": "8d3c1a5e-2b4f-4c6d-9e8f-0a1b2c3d4e5f", "status": "active", "droplet_limit": 5, "email_verified": true},' \
+      ' "database": {"id": "db", "name": "db", "connection": {"protocol": "postgresql", "uri": "postgresql://doadmin:S3cret-pw@db.example.invalid:25060/defaultdb?sslmode=require",' \
+      ' "database": "defaultdb", "host": "db.example.invalid", "port": 25060, "user": "doadmin", "password": "S3cret-pw", "ssl": true}}}' > body.json
+    { printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n'; cat body.json; } > response.http
+    if command -v perl > /dev/null; then
+      perl -MIO::Socket::INET -e '
+        my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 8089, Listen => 5, ReuseAddr => 1) or die "listen: $@\n";
+        open(my $log, ">>", "requests.log") or die "requests.log: $!\n";
+        $log->autoflush(1);
+        while (my $c = $s->accept) {
+          while (defined(my $l = <$c>)) { print {$log} $l; last if $l =~ /^\r?\n\z/ }
+          open(my $r, "<", "response.http") or die "response.http: $!\n";
+          print {$c} <$r>;
+          close $r;
+          close $c;
+        }' &
+    else
+      cat > respond.sh <<'EOF'
+    cr=$(printf '\r')
+    while IFS= read -r line; do
+      printf '%s\n' "$line" >> requests.log
+      case $line in "$cr" | '') break ;; esac
+    done
+    cat response.http
+    EOF
+      nc -lk -s 127.0.0.1 -p 8089 -e sh respond.sh &
+    fi
+    server=$!
+    i=0
+    until grep -q ' 0100007F:1F99 00000000:0000 0A ' /proc/net/tcp; do
+      i=$((i + 1))
+      test "$i" -le 100 || { echo "nothing listens on 127.0.0.1:8089" >&2; exit 1; }
+      sleep 0.1
+    done
+    api=http://127.0.0.1:8089/
+    # auth init checks the token with the validation server and saves it under HOME.
+    doctl auth init -t test-token --token-validation-server http://127.0.0.1:8089 > init.txt 2>&1 || { cat init.txt requests.log >&2; exit 1; }
+    grep -Fqx 'access-token: test-token' "$HOME/.config/doctl/config.yaml" || { cat init.txt "$HOME/.config/doctl/config.yaml" >&2; exit 1; }
+    doctl auth token > token.txt
+    printf '%s\n' test-token > token.want
+    cmp token.want token.txt || { cat token.txt >&2; exit 1; }
+    # Later commands send the saved token.
+    doctl account get -o json -u "$api" > account.json || { cat requests.log >&2; exit 1; }
+    grep -Fq '"email": "test@example.invalid",' account.json || { cat account.json >&2; exit 1; }
+    grep -Fq 'GET /v2/account HTTP/1.1' requests.log || { cat requests.log >&2; exit 1; }
+    grep -Fq 'Authorization: Bearer test-token' requests.log || { cat requests.log >&2; exit 1; }
+    doctl account get --format Email --no-header -u "$api" > email.txt
+    printf '%s\n' test@example.invalid > email.want
+    cmp email.want email.txt || { cat email.txt >&2; exit 1; }
+    # Passwords are masked, in JSON too, unless --show is given.
+    doctl databases connection db -o json -u "$api" > masked.json
+    grep -Fq '"password": "********",' masked.json || { cat masked.json >&2; exit 1; }
+    if grep -Fq 'S3cret-pw' masked.json; then cat masked.json >&2; echo "the password was not masked" >&2; exit 1; fi
+    doctl databases connection db -o json --show -u "$api" > shown.json
+    grep -Fq '"password": "S3cret-pw",' shown.json || { cat shown.json >&2; exit 1; }
+    kill "$server"
+examples:
+  - title: List your Droplets, with the API token from the environment
+    command: docker run --rm -e DIGITALOCEAN_ACCESS_TOKEN ghcr.io/randomcontainers/doctl compute droplet list
+  - title: Create an App Platform app from the spec in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -e DIGITALOCEAN_ACCESS_TOKEN ghcr.io/randomcontainers/doctl apps create --spec app.yaml
+  - title: List your Kubernetes clusters as JSON
+    command: docker run --rm -e DIGITALOCEAN_ACCESS_TOKEN ghcr.io/randomcontainers/doctl kubernetes cluster list -o json
+combos:
+  - with: [openssh-client]
+    default: true
+    base: doctl
+    summary: doctl with the OpenSSH client, which doctl compute ssh runs to log in to Droplets.
+    test:
+      - |
+        # doctl compute ssh looks the Droplet up through the API, then runs ssh
+        # from PATH: the OpenSSH client's wrapper, which works for a UID
+        # without a passwd entry. The stand-in API on 127.0.0.1:8089 (as in
+        # the doctl tests) puts the Droplet at 127.0.0.1, where nothing listens
+        # on port 9.
+        command -v ssh > ssh-path.txt
+        printf '%s\n' /usr/local/bin/ssh > ssh-path.want
+        cmp ssh-path.want ssh-path.txt || { cat ssh-path.txt >&2; exit 1; }
+        printf '%s' '{"droplet": {"id": 1, "name": "web", "image": {"slug": "ubuntu-24-04-x64"},' \
+          ' "networks": {"v4": [{"ip_address": "127.0.0.1", "netmask": "255.0.0.0", "gateway": "", "type": "public"}]}}}' > body.json
+        { printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n'; cat body.json; } > response.http
+        if command -v perl > /dev/null; then
+          perl -MIO::Socket::INET -e '
+            my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 8089, Listen => 5, ReuseAddr => 1) or die "listen: $@\n";
+            open(my $log, ">>", "requests.log") or die "requests.log: $!\n";
+            $log->autoflush(1);
+            while (my $c = $s->accept) {
+              while (defined(my $l = <$c>)) { print {$log} $l; last if $l =~ /^\r?\n\z/ }
+              open(my $r, "<", "response.http") or die "response.http: $!\n";
+              print {$c} <$r>;
+              close $r;
+              close $c;
+            }' &
+        else
+          cat > respond.sh <<'EOF'
+        cr=$(printf '\r')
+        while IFS= read -r line; do
+          printf '%s\n' "$line" >> requests.log
+          case $line in "$cr" | '') break ;; esac
+        done
+        cat response.http
+        EOF
+          nc -lk -s 127.0.0.1 -p 8089 -e sh respond.sh &
+        fi
+        server=$!
+        i=0
+        until grep -q ' 0100007F:1F99 00000000:0000 0A ' /proc/net/tcp; do
+          i=$((i + 1))
+          test "$i" -le 100 || { echo "nothing listens on 127.0.0.1:8089" >&2; exit 1; }
+          sleep 0.1
+        done
+        if doctl compute ssh 1 --ssh-port 9 -t test-token -u http://127.0.0.1:8089/ > ssh.txt 2>&1; then
+          cat ssh.txt >&2; echo "doctl compute ssh succeeded" >&2; exit 1
+        fi
+        grep -Fq 'GET /v2/droplets/1 HTTP/1.1' requests.log || { cat ssh.txt requests.log >&2; exit 1; }
+        grep -Fq 'ssh: connect to host 127.0.0.1 port 9: Connection refused' ssh.txt || { cat ssh.txt >&2; exit 1; }
+        kill "$server"
