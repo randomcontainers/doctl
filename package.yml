@@ -18,7 +18,7 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 2.1.0
+  version: 2.3.0
   # A git archive of the release tag, attached to each release and listed in
   # the release's checksums file.
   artifact:
@@ -26,7 +26,7 @@ upstream:
     checksums:
       url: https://github.com/digitalocean/doctl/releases/download/v{version}/doctl-{version}-checksums.sha256
       algorithm: sha256
-    sha256: cd14716c1ec69dc5ff0a9e062cf1330e122550a69e4968e3385839065ac7cb53
+    sha256: f625683e82516360cdbf913d890e3d4aa4b5517b4e77f4651fc65dbb9dde932c
 image:
   entrypoint: [doctl]
   cmd: [--help]
